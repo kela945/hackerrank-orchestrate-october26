@@ -2,17 +2,17 @@
 """
 Ghost Data Still Exists - Deletion Audit Agent
 Determines whether user personal data deletion was actually completed.
+With intelligent caching for improved performance on repeated runs.
 """
 
 import csv
 import json
-from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-import sqlite3
+from typing import Any, Dict, List, Optional
 
 REPO_ROOT = Path(__file__).parent.parent
 DATASET_DIR = REPO_ROOT / "dataset"
+CACHE_DIR = REPO_ROOT / ".cache"
 
 
 def load_csv(filename: str) -> List[Dict[str, str]]:
@@ -27,10 +27,10 @@ def load_csv(filename: str) -> List[Dict[str, str]]:
 
 
 class DeletionAudit:
-    """Orchestrates deletion audit logic."""
+    """Orchestrates deletion audit logic with caching support."""
 
-    def __init__(self):
-        """Initialize with all dataset files."""
+    def __init__(self, use_cache: bool = True):
+        """Initialize with all dataset files and optional caching."""
         print("Loading datasets...")
         self.deletion_requests = load_csv('deletion_requests.csv')
         self.user_identities = load_csv('user_identities.csv')
@@ -39,6 +39,16 @@ class DeletionAudit:
         self.deletion_rules = load_csv('deletion_rules.csv')
         self.evidence_files = load_csv('evidence_files.csv')
         print(f"Loaded {len(self.deletion_requests)} requests")
+
+        # Initialize caching
+        self.use_cache = use_cache
+        self.deletion_cache = {}
+        self.identity_cache = {}
+        self.evidence_cache = {}
+
+        if self.use_cache:
+            CACHE_DIR.mkdir(exist_ok=True)
+            self._load_caches()
 
         # Build indices for fast lookup
         self._build_indices()
@@ -80,16 +90,64 @@ class DeletionAudit:
                 self.activity_by_resource[resource_id] = []
             self.activity_by_resource[resource_id].append(activity)
 
+    def _load_caches(self):
+        """Load cached results from disk."""
+        cache_files = [
+            (CACHE_DIR / 'deletion_cache.json', self.deletion_cache),
+            (CACHE_DIR / 'identity_cache.json', self.identity_cache),
+            (CACHE_DIR / 'evidence_cache.json', self.evidence_cache),
+        ]
+
+        loaded = 0
+        for cache_file, cache_dict in cache_files:
+            if cache_file.exists():
+                try:
+                    with open(cache_file, 'r') as f:
+                        cached_data = json.load(f)
+                        cache_dict.update(cached_data)
+                        loaded += len(cached_data)
+                except Exception:
+                    pass
+
+        if loaded > 0:
+            print(f"Loaded {loaded} cached results from disk")
+
+    def _save_caches(self):
+        """Save cached results to disk."""
+        if not self.use_cache:
+            return
+
+        try:
+            with open(CACHE_DIR / 'deletion_cache.json', 'w') as f:
+                json.dump(self.deletion_cache, f)
+            with open(CACHE_DIR / 'identity_cache.json', 'w') as f:
+                json.dump(self.identity_cache, f)
+            with open(CACHE_DIR / 'evidence_cache.json', 'w') as f:
+                json.dump(self.evidence_cache, f)
+
+            total_cached = len(self.deletion_cache) + len(self.identity_cache) + len(self.evidence_cache)
+            print(f"Saved {total_cached} results to cache")
+        except Exception as e:
+            print(f"Warning: Could not save cache: {e}")
+
     def resolve_user(self, email: str) -> Optional[Dict[str, str]]:
         """
         Resolve user from email (current or historical).
-        Returns user identity or None.
+        Returns user identity or None. Results are cached.
         """
         email_lower = email.lower()
 
+        # Check cache first
+        if self.use_cache and email_lower in self.identity_cache:
+            cached = self.identity_cache[email_lower]
+            return cached if cached != 'NOT_FOUND' else None
+
         # Check current identities
         if email_lower in self.user_by_email:
-            return self.user_by_email[email_lower]
+            result = self.user_by_email[email_lower]
+            if self.use_cache:
+                self.identity_cache[email_lower] = result
+            return result
 
         # Check historical audit log for this email
         for log in self.user_audit_log:
@@ -98,8 +156,14 @@ class DeletionAudit:
             if old_email == email_lower or new_email == email_lower:
                 user_id = log['user_id']
                 if user_id in self.user_by_id:
-                    return self.user_by_id[user_id]
+                    result = self.user_by_id[user_id]
+                    if self.use_cache:
+                        self.identity_cache[email_lower] = result
+                    return result
 
+        # Not found - cache the negative result
+        if self.use_cache:
+            self.identity_cache[email_lower] = 'NOT_FOUND'
         return None
 
     def get_all_identifiers(self, user_id: str) -> List[str]:
@@ -140,7 +204,12 @@ class DeletionAudit:
         """
         Determine if request_text authorizes account deletion.
         Returns True if deletion is requested, False otherwise.
+        Results are cached for performance.
         """
+        # Check cache first
+        if self.use_cache and request_text in self.deletion_cache:
+            return self.deletion_cache[request_text]
+
         text_lower = request_text.lower()
 
         # Deletion keywords (multiple languages)
@@ -164,6 +233,8 @@ class DeletionAudit:
         has_deletion = any(keyword in text_lower for keyword in deletion_keywords)
 
         if not has_deletion:
+            if self.use_cache:
+                self.deletion_cache[request_text] = False
             return False
 
         # Strong non-deletion indicators
@@ -181,8 +252,12 @@ class DeletionAudit:
         ]
 
         has_strong_exclusion = any(excl in text_lower for excl in strong_exclusions)
+        result = not has_strong_exclusion
 
-        return not has_strong_exclusion
+        if self.use_cache:
+            self.deletion_cache[request_text] = result
+
+        return result
 
     def find_data_in_evidence(self, identifiers: List[str]) -> Dict[str, List[str]]:
         """Find what data is present in evidence files for given identifiers."""
@@ -455,9 +530,12 @@ class DeletionAudit:
             if status in statuses:
                 print(f"  {status}: {statuses[status]}")
 
+        # Save caches for future runs
+        self._save_caches()
+
         return output_data
 
 
 if __name__ == '__main__':
-    audit = DeletionAudit()
+    audit = DeletionAudit(use_cache=True)
     audit.run()
